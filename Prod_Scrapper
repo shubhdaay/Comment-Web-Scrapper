@@ -1,0 +1,564 @@
+# Amazon Reimbursement Web Scraper — Excel-only GUI
+# Tkinter + ttkbootstrap + Selenium (Firefox)
+# - Input: Excel (.xlsx) with a column named "TransactionID"
+# - Flow: open URL -> wait RMS shell -> EXPAND ALL (verified) -> scroll event region (virtualized) -> parse table/ARIA table
+# - Output: Excel with Serial No / Transaction ID / Comment
+
+import os
+import re
+import time
+import threading
+import queue
+import pandas as pd
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+import ttkbootstrap as tb
+from ttkbootstrap.scrolled import ScrolledText
+
+# Selenium
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from selenium.webdriver.firefox.service import Service as FirefoxService
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
+
+# ---------------- Config ----------------
+BASE_URL = "https://console-eu.seller-reimbursement.amazon.dev/rms/view/transaction/"
+PAGE_TIMEOUT = 120     # generous for first login
+ELEM_TIMEOUT = 40
+SCROLL_PAUSE = 0.3
+
+def _t(s):  # safe text
+    return (s or "").strip()
+
+# ---------------- Expand helpers (strict & verified) ----------------
+def _count_visible_rows(driver):
+    try:
+        return len(driver.find_elements(By.CSS_SELECTOR, "[role='table'] [role='row']")) + \
+               len(driver.find_elements(By.CSS_SELECTOR, "table tr"))
+    except Exception:
+        return 0
+
+def _find_expand_button(driver, log=None):
+    # Direct shadow DOM selector for speed (no fallback)
+    try:
+        js = '''
+        const host = document.querySelector('kat-expander');
+        if (host && host.shadowRoot) {
+            return host.shadowRoot.querySelector('button[part="expander-header"]');
+        }
+        return null;
+        '''
+        btn = driver.execute_script(js)
+        return btn
+    except Exception:
+        return None
+
+def _expand_all_reliably(driver, log, max_attempts=1, wait_timeout=3):
+    """Click Expand All and verify via aria-expanded flip or row-count growth. Waits for button to be interactable."""
+    before_rows = _count_visible_rows(driver)
+    for attempt in range(1, max_attempts + 1):
+        btn = None
+        t0 = time.time()
+        while time.time() - t0 < wait_timeout:
+            btn = _find_expand_button(driver, log=log)
+            if btn:
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                    WebDriverWait(driver, 1).until(EC.element_to_be_clickable(btn))
+                    break
+                except Exception:
+                    pass
+            time.sleep(0.1)
+        if not btn:
+            log(f"Expand All not found or not clickable (attempt {attempt}/{max_attempts}).")
+            continue
+        try:
+            prev_state = None
+            try:
+                prev_state = btn.get_attribute("aria-expanded")
+            except Exception:
+                pass
+            btn.click()
+            time.sleep(0.1)
+            after_rows = _count_visible_rows(driver)
+            new_state = None
+            try:
+                new_state = btn.get_attribute("aria-expanded")
+            except Exception:
+                new_state = prev_state
+            if (prev_state is not None and new_state != prev_state) or after_rows > before_rows:
+                log(f"✔ Expand All confirmed (attempt {attempt}). Rows: {before_rows} → {after_rows}")
+                return True
+            else:
+                log(f"Expand click didn’t change rows/state (attempt {attempt}). Retrying…")
+                before_rows = after_rows
+        except Exception as e:
+            log(f"Expand click failed (attempt {attempt}): {e}")
+            time.sleep(0.1)
+    log("Proceeding without confirmed expansion.")
+    return False
+
+# ---------------- Event History region & scrolling ----------------
+def _wait_for_event_history_region(driver, timeout=40):
+    # find a section/card with a heading containing 'Event History'
+    locator = (
+        By.XPATH,
+        "//*[self::h1 or self::h2 or self::h3 or self::h4]"
+        "[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'event history')]/ancestor::*[self::section or self::div][1]"
+    )
+    return WebDriverWait(driver, timeout).until(EC.presence_of_element_located(locator))
+
+def _scroll_within(driver, container, steps=8, pause=0.25):
+    """Scroll a container (or window) to trigger lazy/virtualized rows."""
+    try:
+        scrollable = container
+        is_scroll = driver.execute_script(
+            "const el=arguments[0];return el.scrollHeight>el.clientHeight;", scrollable)
+        if not is_scroll:
+            # fallback to window scroll
+            for _ in range(steps):
+                driver.execute_script("window.scrollBy(0, window.innerHeight * 0.85);")
+                time.sleep(pause)
+            return
+        for _ in range(steps):
+            driver.execute_script(
+                "arguments[0].scrollTop = arguments[0].scrollTop + arguments[0].clientHeight;", scrollable)
+            time.sleep(pause)
+    except Exception:
+        for _ in range(steps):
+            driver.execute_script("window.scrollBy(0, window.innerHeight * 0.85);")
+            time.sleep(pause)
+
+# ---------------- Table parsing (ARIA or HTML) ----------------
+def _read_headers(table_el):
+    # ARIA headers
+    try:
+        hdrs = [_t(c.text) for c in table_el.find_elements(By.CSS_SELECTOR, "[role='row'] [role='columnheader']")]
+        if any(hdrs):
+            return hdrs
+    except Exception:
+        pass
+    # HTML thead
+    try:
+        hdrs = [_t(c.text) for c in table_el.find_elements(By.CSS_SELECTOR, "thead th")]
+        if any(hdrs):
+            return hdrs
+    except Exception:
+        pass
+    # Fallback: first row cells
+    try:
+        cells = table_el.find_elements(By.CSS_SELECTOR, "[role='row'] [role='cell'], tr:first-child th, tr:first-child td")
+        return [_t(c.text) for c in cells]
+    except Exception:
+        return []
+
+def _locate_event_table(driver):
+    candidates = []
+    try:
+        candidates += driver.find_elements(By.CSS_SELECTOR, "[role='table']")
+    except Exception:
+        pass
+    try:
+        candidates += driver.find_elements(By.TAG_NAME, "table")
+    except Exception:
+        pass
+
+    for tbl in candidates:
+        hdrs = _read_headers(tbl)
+        lower = [h.lower() for h in hdrs]
+        has_action = any("action type" in h or h == "action" for h in lower)
+        has_comment = any(any(k in h for k in ["comment", "remarks", "note"]) for h in lower)
+        if has_action and has_comment:
+            return tbl, {h.lower(): i for i, h in enumerate(hdrs)}
+
+    if candidates:
+        hdrs = _read_headers(candidates[0])
+        return candidates[0], {h.lower(): i for i, h in enumerate(hdrs)}
+
+    raise TimeoutException("No table-like element found on the page.")
+
+def _stream_rows(driver, table_el):
+    aria_rows = "[role='row']"
+    aria_cells = "[role='cell'],[role='gridcell']"
+    html_rows = "tbody tr, tr"
+    html_cells = "td, th"
+
+    # find a scrollable container (table or ancestor)
+    scrollable = table_el
+    try:
+        is_scroll = driver.execute_script("const el=arguments[0];return el.scrollHeight>el.clientHeight;", scrollable)
+        if not is_scroll:
+            parent = table_el
+            for _ in range(5):
+                parent = parent.find_element(By.XPATH, "./..")
+                if driver.execute_script("const el=arguments[0];return el.scrollHeight>el.clientHeight;", parent):
+                    scrollable = parent
+                    break
+    except Exception:
+        pass
+
+    seen, last_h, stable = set(), -1, 0
+    while True:
+        rows = table_el.find_elements(By.CSS_SELECTOR, aria_rows)
+        use_aria = True
+        if not rows:
+            rows = table_el.find_elements(By.CSS_SELECTOR, html_rows)
+            use_aria = False
+
+        for r in rows:
+            try:
+                cells = r.find_elements(By.CSS_SELECTOR, aria_cells) if use_aria else r.find_elements(By.CSS_SELECTOR, html_cells)
+                if not cells:
+                    continue
+                texts = [_t(c.text) for c in cells]
+                key = "|".join(texts)
+                if key in seen:
+                    continue
+                seen.add(key)
+                yield texts
+            except StaleElementReferenceException:
+                continue
+
+        # scroll to load more (virtualized)
+        try:
+            prev = driver.execute_script("return arguments[0].scrollTop;", scrollable)
+            driver.execute_script("arguments[0].scrollTop += arguments[0].clientHeight;", scrollable)
+            time.sleep(SCROLL_PAUSE)
+            cur = driver.execute_script("return arguments[0].scrollTop;", scrollable)
+            new_h = driver.execute_script("return arguments[0].scrollHeight;", scrollable)
+            if cur == prev and new_h == last_h:
+                stable += 1
+            else:
+                stable = 0
+            if stable >= 2:
+                break
+            last_h = new_h
+        except Exception:
+            break
+
+def _get_creation_comment(driver):
+    table_el, hdrmap = _locate_event_table(driver)
+    # Robust fuzzy matching for headers
+    def fuzzy_idx(names):
+        for k, i in hdrmap.items():
+            k_low = k.strip().lower()
+            for n in names:
+                if n in k_low:
+                    return i
+        return None
+    action_i = fuzzy_idx(["action type", "action"])
+    comment_i = fuzzy_idx(["comment", "remarks", "note", "description"])
+    # Scan all rows, return the comment for the row where Action Type == 'creation' (case-insensitive)
+    for row in _stream_rows(driver, table_el):
+        if action_i is not None and action_i < len(row):
+            if row[action_i].strip().lower() == "creation":
+                if comment_i is not None and comment_i < len(row):
+                    comment = row[comment_i].strip()
+                    if comment:
+                        return comment
+                # Fallback: return last cell in the row if comment column not found
+                if row:
+                    return row[-1].strip()
+    # Debug: log headers and first row if not found
+    print(f"DEBUG: Headers: {list(hdrmap.keys())}")
+    try:
+        first_row = next(_stream_rows(driver, table_el))
+        print(f"DEBUG: First row: {first_row}")
+    except Exception:
+        pass
+    return "Not found"
+
+# ---------------- Robust Scraper (Refactored) ----------------
+def robust_scrape_worker(excel_path, output_path, gecko_path, firefox_path, uiq, cancel_flag=None):
+    def log(msg): uiq.put(("log", msg))
+    def status(msg): uiq.put(("status", msg))
+    results = []
+
+    # Read IDs
+    try:
+        df = pd.read_excel(excel_path)
+        if "TransactionID" not in df.columns:
+            raise ValueError("Excel must have a column named 'TransactionID'.")
+        txids = [str(x).strip() for x in df["TransactionID"].tolist() if str(x).strip()]
+        if not txids:
+            raise ValueError("No TransactionID values found.")
+    except Exception as e:
+        uiq.put(("error", f"Input error: {e}"))
+        return
+
+    # Driver setup
+    options = FirefoxOptions()
+    if firefox_path:
+        options.binary_location = firefox_path
+    service = FirefoxService(executable_path=gecko_path) if gecko_path else FirefoxService()
+
+    driver = None
+    try:
+        driver = webdriver.Firefox(service=service, options=options)
+        driver.maximize_window()
+        log("🦊 Firefox launched. If SSO is required, log in in the opened window.")
+
+        total = len(txids)
+        login_prompted = False
+        for i, tid in enumerate(txids, start=1):
+            if cancel_flag and cancel_flag.is_set():
+                log("❌ Cancelled by user. Saving partial results…")
+                break
+            status(f"Processing {i}/{total}: {tid}")
+            url = BASE_URL + tid
+            log(f"➡ Opening {url}")
+            driver.get(url)
+            if not login_prompted:
+                messagebox.showinfo('Login Required', 'Please log in to Amazon in the opened Firefox window.\nAfter logging in, click OK to continue. Do NOT close the browser window!')
+                login_prompted = True
+                # Wait for transaction page
+                for _ in range(30):
+                    if driver.find_elements(By.CSS_SELECTOR, "kat-expander, [part='expander-header'], [role='table'], table"):
+                        break
+                    time.sleep(2)
+                driver.get(url)
+                time.sleep(2)
+            driver.implicitly_wait(3)
+            comment = ''
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(1)
+
+            # 1) Try all possible selectors for Expand All
+            expand_clicked = False
+            for sel in [
+                "kat-expander", "button[part='expander-header']", "[aria-label*='Expand All']", "//*[contains(text(),'Expand All')]"
+            ]:
+                try:
+                    btn = None
+                    if '//' in sel:
+                        btns = driver.find_elements(By.XPATH, sel)
+                    else:
+                        btns = driver.find_elements(By.CSS_SELECTOR, sel)
+                    for b in btns:
+                        if b.is_displayed() and b.is_enabled():
+                            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", b)
+                            b.click()
+                            log("✔ Expand All clicked.")
+                            expand_clicked = True
+                            break
+                    if expand_clicked:
+                        break
+                except Exception:
+                    continue
+            if not expand_clicked:
+                log("⚠ Could not find/click Expand All. Proceeding anyway.")
+
+            # 2) Aggressive scroll to load all rows
+            for _ in range(10):
+                driver.execute_script("window.scrollBy(0, window.innerHeight * 0.85);")
+                time.sleep(0.2)
+
+            # 3) Try to locate the Event History table
+            table = None
+            hdrmap = {}
+            for sel in ["[role='table']", "table"]:
+                try:
+                    tables = driver.find_elements(By.CSS_SELECTOR, sel)
+                    for t in tables:
+                        hdrs = [_t(c.text) for c in t.find_elements(By.CSS_SELECTOR, "[role='columnheader'], thead th, tr:first-child th, tr:first-child td")]
+                        lower = [h.lower() for h in hdrs]
+                        if any("action" in h for h in lower) and any("comment" in h or "remark" in h or "note" in h for h in lower):
+                            table = t
+                            hdrmap = {h.lower(): idx for idx, h in enumerate(hdrs)}
+                            break
+                    if table:
+                        break
+                except Exception:
+                    continue
+            if not table:
+                log("⚠ No table found. Skipping.")
+                comment = "Not found"
+            else:
+                # 4) Extract rows and find CREATION comment
+                rows = table.find_elements(By.CSS_SELECTOR, "[role='row'], tbody tr, tr")
+                action_i = next((hdrmap[k] for k in hdrmap if "action" in k), None)
+                comment_i = next((hdrmap[k] for k in hdrmap if any(x in k for x in ["comment", "remark", "note"])), None)
+                found = False
+                for r in rows:
+                    cells = r.find_elements(By.CSS_SELECTOR, "[role='cell'], td, th")
+                    texts = [_t(c.text) for c in cells]
+                    if action_i is not None and action_i < len(texts):
+                        if texts[action_i].strip().lower() == "creation":
+                            if comment_i is not None and comment_i < len(texts):
+                                comment = texts[comment_i].strip()
+                                found = True
+                                break
+                            elif texts:
+                                comment = texts[-1].strip()
+                                found = True
+                                break
+                if not found:
+                    log("⚠ CREATION comment not found in table.")
+                    comment = "Not found"
+
+            results.append({
+                "Serial No": i,
+                "Transaction ID": tid,
+                "Comment": comment if comment else "Not found"
+            })
+
+        # Save output
+        out_df = pd.DataFrame(results)
+        out_df.to_excel(output_path, index=False)
+        status(f"✅ Done. Saved to {os.path.abspath(output_path)}")
+        uiq.put(("info", f"Scraping complete!\nSaved: {os.path.abspath(output_path)}"))
+
+    except Exception as e:
+        uiq.put(("error", f"Runtime error: {e}"))
+    finally:
+        try:
+            if driver:
+                driver.quit()
+        except Exception:
+            pass
+        log("🧹 Browser closed.")
+
+# ---------------- GUI ----------------
+def main_gui():
+    app = tb.Window(themename="cosmo")
+    app.title("Amazon Transaction Web Scraper — Excel Only")
+    app.geometry("760x540")
+    app.resizable(True, True)
+
+    uiq = queue.Queue()
+    cancel_flag = threading.Event()
+
+    # Header
+    header = tb.Frame(app, padding=12)
+    header.pack(fill="x")
+    tb.Label(header, text="Amazon Transaction Web Scraper", font=("Segoe UI", 20, "bold")).pack(anchor="w")
+    tb.Label(
+        header,
+        text="Input: Excel with 'TransactionID'. The tool expands Event History and extracts the CREATION comment.",
+        bootstyle="secondary"
+    ).pack(anchor="w", pady=(4, 0))
+
+    # Card
+    card = tb.Frame(app, padding=16, bootstyle="secondary")
+    card.pack(fill="x", padx=12, pady=8)
+
+    excel_var = tk.StringVar()
+    out_var = tk.StringVar(value=os.path.join(os.path.expanduser('~'), 'Desktop', 'scraped_results.xlsx'))
+    gecko_var = tk.StringVar()     # optional geckodriver path
+    ff_var = tk.StringVar(value=r"C:\Program Files\Mozilla Firefox\firefox.exe")  # default Firefox path
+
+    # Excel row
+    tb.Label(card, text="Excel file (.xlsx):").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
+    excel_entry = tb.Entry(card, textvariable=excel_var)
+    excel_entry.grid(row=0, column=1, sticky="we", padx=(0, 8), pady=6)
+    tb.Button(card, text="Browse", bootstyle="primary",
+              command=lambda: excel_var.set(filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx")]) or excel_var.get())
+              ).grid(row=0, column=2, pady=6)
+
+    # Output row
+    tb.Label(card, text="Output file:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=6)
+    out_entry = tb.Entry(card, textvariable=out_var)
+    out_entry.grid(row=1, column=1, sticky="we", padx=(0, 8), pady=6)
+    tb.Button(card, text="Choose", command=lambda: out_var.set(
+        filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")]) or out_var.get()
+    )).grid(row=1, column=2, pady=6)
+
+    # Advanced
+    adv = tb.Labelframe(card, text="Advanced (optional)", padding=10)
+    adv.grid(row=2, column=0, columnspan=3, sticky="we", pady=(6, 0))
+    tb.Label(adv, text="geckodriver path:").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+    tb.Entry(adv, textvariable=gecko_var).grid(row=0, column=1, sticky="we", pady=4)
+    tb.Button(adv, text="Browse", command=lambda: gecko_var.set(filedialog.askopenfilename() or gecko_var.get())).grid(row=0, column=2, padx=6)
+
+    tb.Label(adv, text="Firefox binary path:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+    tb.Entry(adv, textvariable=ff_var).grid(row=1, column=1, sticky="we", pady=4)
+    tb.Button(adv, text="Browse", command=lambda: ff_var.set(filedialog.askopenfilename() or ff_var.get())).grid(row=1, column=2, padx=6)
+
+    card.columnconfigure(1, weight=1)
+    adv.columnconfigure(1, weight=1)
+
+    # Controls
+    controls = tb.Frame(app, padding=(12, 0))
+    controls.pack(fill="x")
+    status_var = tk.StringVar(value="Idle.")
+    start_btn = tb.Button(controls, text="Start Scraping", bootstyle="success-outline")
+    start_btn.pack(side="left")
+    cancel_btn = tb.Button(controls, text="Cancel", bootstyle="danger-outline", state="disabled")
+    cancel_btn.pack(side="left", padx=8)
+    tb.Label(controls, textvariable=status_var).pack(side="left", padx=12)
+
+    prog = tb.Progressbar(app, mode="indeterminate")
+    prog.pack(fill="x", padx=12, pady=(6, 0))
+
+    # Logs
+    log_box = ScrolledText(app, height=12, autohide=True, bootstyle="secondary")
+    log_box.pack(fill="both", expand=True, padx=12, pady=8)
+    log_box.text['state'] = 'disabled'
+
+    def log(msg):
+        log_box.text['state'] = 'normal'
+        log_box.text.insert("end", msg + "\n")
+        log_box.text.see("end")
+        log_box.text['state'] = 'disabled'
+
+    # Queue pump
+    def pump():
+        try:
+            while True:
+                kind, msg = uiq.get_nowait()
+                if kind == "status":
+                    status_var.set(msg)
+                elif kind == "log":
+                    log(msg)
+                elif kind == "info":
+                    status_var.set("Done.")
+                    prog.stop()
+                    start_btn.configure(state="normal")
+                    cancel_btn.configure(state="disabled")
+                    messagebox.showinfo("Completed", msg)
+                elif kind == "error":
+                    status_var.set("Error.")
+                    prog.stop()
+                    start_btn.configure(state="normal")
+                    cancel_btn.configure(state="disabled")
+                    messagebox.showerror("Error", msg)
+        except queue.Empty:
+            pass
+        app.after(120, pump)
+
+    pump()
+
+    def on_start():
+        excel = excel_var.get().strip()
+        out = (out_var.get().strip() or os.path.join(os.path.expanduser('~'), 'Desktop', 'scraped_results.xlsx'))
+        ff_path = ff_var.get().strip() or r"C:\Program Files\Mozilla Firefox\firefox.exe"
+        if not excel:
+            messagebox.showerror("Input required", "Please choose an Excel file (.xlsx) with a 'TransactionID' column.")
+            return
+        start_btn.configure(state="disabled")
+        cancel_btn.configure(state="normal")
+        status_var.set("Starting…")
+        prog.start(10)
+        log_box.text['state'] = 'normal'; log_box.text.delete("1.0", "end"); log_box.text['state'] = 'disabled'
+        cancel_flag.clear()
+        threading.Thread(
+            target=robust_scrape_worker,
+            args=(excel, out, gecko_var.get().strip() or None, ff_path, uiq, cancel_flag),
+            daemon=True
+        ).start()
+
+    def on_cancel():
+        cancel_flag.set()
+        status_var.set("Cancelling…")
+        cancel_btn.configure(state="disabled")
+
+    start_btn.configure(command=on_start)
+    cancel_btn.configure(command=on_cancel)
+    app.mainloop()
+
+if __name__ == "__main__":
+    main_gui()
